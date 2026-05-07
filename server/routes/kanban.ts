@@ -75,14 +75,6 @@ const activePollTimers = new Set<ReturnType<typeof setTimeout>>();
 const activeWatcherStops = new Set<() => void>();
 const activeBackgroundTasks = new Set<Promise<unknown>>();
 
-function trackTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
-  const id = setTimeout(() => {
-    activePollTimers.delete(id);
-    fn();
-  }, ms);
-  activePollTimers.add(id);
-  return id;
-}
 
 function trackBackgroundTask<T>(task: Promise<T>): Promise<T> {
   const tracked = task.finally(() => {
@@ -1669,7 +1661,7 @@ export async function resumeKanbanWatchers(): Promise<void> {
 
     const isFallback = correlationKey.startsWith('kanban-root:');
     if (isFallback) {
-      const parentSessionKey = resolveKanbanFallbackParentSessionKey(task.assignee);
+      const parentSessionKey = resolveKanbanAssigneeRootSessionKey(task.assignee);
       if (!parentSessionKey) {
         console.warn(`[kanban] resumeKanbanWatchers: no parent session for task ${task.id}`);
         continue;
