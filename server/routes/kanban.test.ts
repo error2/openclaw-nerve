@@ -3008,3 +3008,91 @@ describe('full workflow via HTTP', () => {
     expect(reExecuted.run!.status).toBe('running');
   });
 });
+
+// ── resumeKanbanWatchers ─────────────────────────────────────────────
+
+describe('resumeKanbanWatchers', () => {
+  it('resumes watchers for in-progress tasks on startup (event-driven completion)', async () => {
+    let subagentsState: 'running' | 'done' = 'running';
+    let subagentsCalls = 0;
+
+    const invokeGatewayToolMock = vi.fn(async (tool: string) => {
+      if (tool === 'sessions_spawn') {
+        return { sessionKey: 'agent:main:subagent:resume-watcher-child' };
+      }
+      if (tool === 'subagents') {
+        subagentsCalls += 1;
+        const entry = {
+          label: '__PLACEHOLDER__',
+          sessionKey: 'agent:main:subagent:resume-watcher-child',
+          childSessionKey: 'agent:main:subagent:resume-watcher-child',
+          status: subagentsState,
+        };
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ active: subagentsState === 'running' ? [entry] : [], recent: subagentsState === 'done' ? [entry] : [] }) }],
+        };
+      }
+      if (tool === 'sessions_history') {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ messages: [{ role: 'assistant', content: 'resumed watcher completion result' }] }) }],
+        };
+      }
+      return {};
+    }) as GatewayToolMock;
+
+    // Step 1: Set up the app, create a task, and execute it to get an in-progress run.
+    const app = await buildApp({ invokeGatewayToolMock, executionMode: 'primary' });
+    const task = await createTask(app, { status: 'todo' });
+
+    const execRes = await app.request(`/api/kanban/tasks/${task.id}/execute`, json({}));
+    expect(execRes.status).toBe(200);
+
+    // Wait for the fire-and-forget RPC helper to attach run identifiers to the task.
+    await vi.waitFor(async () => {
+      expect(subagentsCalls).toBeGreaterThan(0);
+    }, { timeout: 2_000, interval: 25 });
+
+    // Step 2: Clean up existing pollers (simulating a Nerve crash/restart).
+    const mod = await import('./kanban.js');
+    await mod.cleanupKanbanPollers();
+
+    // Verify the task is still in-progress (orphaned run).
+    const orphanedTask = await (await app.request(`/api/kanban/tasks/${task.id}`)).json() as KanbanTask;
+    expect(orphanedTask.status).toBe('in-progress');
+    expect(orphanedTask.run?.status).toBe('running');
+
+    // Reset call count to isolate resumed-watcher behavior.
+    subagentsCalls = 0;
+
+    // Step 3 (causality check): fire emitSessionsChanged with session 'done' BEFORE resuming.
+    // The original watcher has been stopped by cleanupKanbanPollers, so its session-events
+    // listener is gone — this emit must NOT advance the task.
+    const sessionEvents = await import('../lib/session-events.js');
+    subagentsState = 'done';
+    sessionEvents.emitSessionsChanged({});
+    sessionEvents.emitSessionsChanged({});
+    // Give a moment for any stale listener to incorrectly fire.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const stillOrphaned = await (await app.request(`/api/kanban/tasks/${task.id}`)).json() as KanbanTask;
+    expect(stillOrphaned.status).toBe('in-progress'); // no listener active — task must NOT advance
+
+    // Step 4: Call resumeKanbanWatchers — this should re-attach a watcher for the orphaned task.
+    await mod.resumeKanbanWatchers();
+
+    // Watcher should make at least one check via the subagents poll (session is already 'done').
+    await vi.waitFor(async () => {
+      expect(subagentsCalls).toBeGreaterThan(0);
+    }, { timeout: 2_000, interval: 25 });
+
+    // Step 5: Fire sessions.changed to trigger event-driven completion via the resumed watcher.
+    sessionEvents.emitSessionsChanged({});
+    sessionEvents.emitSessionsChanged({});
+    sessionEvents.emitSessionsChanged({});
+
+    // Step 6: Task should transition to 'review' (terminal for primary completion).
+    await vi.waitFor(async () => {
+      const current = await (await app.request(`/api/kanban/tasks/${task.id}`)).json() as KanbanTask;
+      expect(current.status).toBe('review');
+    }, { timeout: 2_000, interval: 25 });
+  });
+});

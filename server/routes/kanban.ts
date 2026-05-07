@@ -72,6 +72,7 @@ function parseGatewayResponse(result: unknown): Record<string, unknown> {
 // ── Active poll timer tracking (for graceful shutdown) ───────────────
 
 const activePollTimers = new Set<ReturnType<typeof setTimeout>>();
+const activeWatcherStops = new Set<() => void>();
 const activeBackgroundTasks = new Set<Promise<unknown>>();
 
 function trackTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
@@ -93,13 +94,20 @@ function trackBackgroundTask<T>(task: Promise<T>): Promise<T> {
 
 /** Cancel all active poll timers and await pending async launch bookkeeping (call on shutdown). */
 export async function cleanupKanbanPollers(): Promise<void> {
+  // Clear timers first so any in-flight wakeup doesn't reschedule.
+  for (const t of activePollTimers) clearTimeout(t);
+  activePollTimers.clear();
+
+  // Stop all live watchers (unsubscribes session-events listeners + clears their fallback timers).
+  for (const stop of [...activeWatcherStops]) {
+    try { stop(); } catch (err) { console.warn('[kanban] cleanup stop failed:', err); }
+  }
+  activeWatcherStops.clear();
+
   const pendingBackgroundTasks = Array.from(activeBackgroundTasks);
   if (pendingBackgroundTasks.length > 0) {
     await Promise.allSettled(pendingBackgroundTasks);
   }
-
-  for (const t of activePollTimers) clearTimeout(t);
-  activePollTimers.clear();
 }
 
 interface GatewaySessionSummary {
@@ -333,6 +341,7 @@ function pollSessionCompletion(
   const stop = () => {
     if (stopped) return;
     stopped = true;
+    activeWatcherStops.delete(stop);
     if (unsubscribe) {
       unsubscribe();
       unsubscribe = null;
@@ -343,6 +352,7 @@ function pollSessionCompletion(
       fallbackTimer = null;
     }
   };
+  activeWatcherStops.add(stop);
 
   const check = async (): Promise<'continue' | 'stop'> => {
     if (Date.now() - startedAt > maxLifetimeMs) {
@@ -490,6 +500,7 @@ function pollFallbackSessionCompletion(
   const stop = () => {
     if (stopped) return;
     stopped = true;
+    activeWatcherStops.delete(stop);
     if (unsubscribe) {
       unsubscribe();
       unsubscribe = null;
@@ -500,6 +511,7 @@ function pollFallbackSessionCompletion(
       fallbackTimer = null;
     }
   };
+  activeWatcherStops.add(stop);
 
   const check = async (): Promise<'continue' | 'stop'> => {
     if (Date.now() - startedAt > maxLifetimeMs) {
@@ -1632,5 +1644,57 @@ app.post('/api/kanban/tasks/:id/complete', rateLimitGeneral, async (c) => {
     return handleWorkflowError(c, err);
   }
 });
+
+/**
+ * Re-attach watchers for any kanban task that is `in-progress` with a
+ * running run. Called on Nerve startup to recover from crashes/restarts
+ * that orphaned in-memory pollers. Without this, a restart leaves
+ * tasks stuck `in-progress` until manually aborted.
+ */
+export async function resumeKanbanWatchers(): Promise<void> {
+  const store = getKanbanStore();
+  let items: import('../lib/kanban-store.js').KanbanTask[];
+  try {
+    const result = await store.listTasks({ status: ['in-progress'] });
+    items = result.items;
+  } catch (err) {
+    console.warn('[kanban] resumeKanbanWatchers: listTasks failed:', (err as Error).message);
+    return;
+  }
+
+  for (const task of items) {
+    if (task.run?.status !== 'running') continue;
+    const correlationKey = task.run.sessionKey;
+    if (!correlationKey) continue;
+
+    const isFallback = correlationKey.startsWith('kanban-root:');
+    if (isFallback) {
+      const parentSessionKey = resolveKanbanFallbackParentSessionKey(task.assignee);
+      if (!parentSessionKey) {
+        console.warn(`[kanban] resumeKanbanWatchers: no parent session for task ${task.id}`);
+        continue;
+      }
+      // expectedChildLabel: derive from correlationKey by stripping the 'kanban-root:' prefix.
+      // knownSessionKeysBefore: empty — we don't know which sessions existed before the crash,
+      // so the fallback poller will re-detect the child session on the next wakeup.
+      const expectedChildLabel = correlationKey.replace(/^kanban-root:/, '');
+      pollFallbackSessionCompletion(store, task.id, {
+        correlationKey,
+        parentSessionKey,
+        childSessionKey: task.run.childSessionKey,
+        expectedChildLabel,
+        knownSessionKeysBefore: task.run.childSessionKey ? [parentSessionKey, task.run.childSessionKey] : [parentSessionKey],
+        runId: task.run.runId,
+      });
+    } else {
+      pollSessionCompletion(store, task.id, {
+        correlationKey,
+        childSessionKey: task.run.childSessionKey,
+        runId: task.run.runId,
+      });
+    }
+    console.log(`[kanban] Resumed watcher for task ${task.id} (runKey: ${correlationKey})`);
+  }
+}
 
 export default app;
