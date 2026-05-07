@@ -478,17 +478,34 @@ function pollFallbackSessionCompletion(
   store: ReturnType<typeof getKanbanStore>,
   taskId: string,
   identity: KanbanFallbackRunIdentity,
-  intervalMs = 5_000,
-  maxAttempts = 720,
+  fallbackIntervalMs = config.kanbanFallbackPollMs,
+  maxLifetimeMs = 60 * 60 * 1_000, // 60 minutes
 ): void {
-  let attempts = 0;
+  const startedAt = Date.now();
+  let inFlight = false;
+  let stopped = false;
+  let unsubscribe: (() => void) | null = null;
+  let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const poll = async () => {
-    attempts++;
-    if (attempts > maxAttempts) {
-      console.warn(`[kanban] Polling timed out for task ${taskId} (runKey: ${identity.correlationKey})`);
-      await store.completeRun(taskId, identity.correlationKey, undefined, 'Run timed out (polling limit reached)').catch(() => {});
-      return;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (unsubscribe) {
+      unsubscribe();
+      unsubscribe = null;
+    }
+    if (fallbackTimer) {
+      clearTimeout(fallbackTimer);
+      activePollTimers.delete(fallbackTimer);
+      fallbackTimer = null;
+    }
+  };
+
+  const check = async (): Promise<'continue' | 'stop'> => {
+    if (Date.now() - startedAt > maxLifetimeMs) {
+      console.warn(`[kanban] Watcher lifetime exceeded for task ${taskId} (runKey: ${identity.correlationKey})`);
+      await store.completeRun(taskId, identity.correlationKey, undefined, 'Run timed out (watcher lifetime exceeded)').catch(() => {});
+      return 'stop';
     }
 
     try {
@@ -499,7 +516,7 @@ function pollFallbackSessionCompletion(
         || task.run?.status !== 'running'
         || task.run?.sessionKey !== identity.correlationKey
       ) {
-        return;
+        return 'stop';
       }
 
       const sessionsResponse = await gatewayRpcCall('sessions.list', {
@@ -526,14 +543,12 @@ function pollFallbackSessionCompletion(
       }
 
       if (!activeSessionKey) {
-        trackTimeout(poll, intervalMs);
-        return;
+        return 'continue';
       }
 
       const session = sessions.find((candidate) => getSessionKey(candidate) === activeSessionKey);
       if (!session) {
-        trackTimeout(poll, intervalMs);
-        return;
+        return 'continue';
       }
 
       const status = session.status;
@@ -553,7 +568,7 @@ function pollFallbackSessionCompletion(
             console.warn(`[kanban] Failed to report child failure back to ${identity.parentSessionKey}:`, err);
           }
         }
-        return;
+        return 'stop';
       }
 
       const agentState = session.agentState;
@@ -582,7 +597,7 @@ function pollFallbackSessionCompletion(
           console.error(`[kanban] Failed to complete run for task ${taskId}:`, err);
           return null;
         });
-        if (!completedTask) return;
+        if (!completedTask) return 'stop';
 
         console.log(`[kanban] Run completed for task ${taskId} (runKey: ${identity.correlationKey}, child: ${activeSessionKey})`);
 
@@ -610,17 +625,48 @@ function pollFallbackSessionCompletion(
         } catch (err) {
           console.warn(`[kanban] Failed to report child completion back to ${identity.parentSessionKey}:`, err);
         }
-        return;
+        return 'stop';
       }
 
-      trackTimeout(poll, intervalMs);
+      return 'continue';
     } catch (err) {
       console.error(`[kanban] Poll error for task ${taskId}:`, err);
-      trackTimeout(poll, intervalMs);
+      // Don't tear the watcher down on transient errors — let the next event/timer retry.
+      return 'continue';
     }
   };
 
-  trackTimeout(poll, 3_000);
+  const wakeup = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const next = await check();
+      if (next === 'stop') stop();
+    } catch (err) {
+      console.error(`[kanban] Watcher error for task ${taskId}:`, err);
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const scheduleFallback = () => {
+    if (stopped) return;
+    const timer = setTimeout(() => {
+      activePollTimers.delete(timer);
+      if (fallbackTimer === timer) fallbackTimer = null;
+      void (async () => {
+        await wakeup();
+        if (!stopped) scheduleFallback();
+      })();
+    }, fallbackIntervalMs);
+    fallbackTimer = timer;
+    activePollTimers.add(timer);
+  };
+
+  unsubscribe = onSessionsChanged(() => { void wakeup(); });
+  scheduleFallback();
+  // Immediate first check (replaces the old hardcoded 3s warm-up).
+  void wakeup();
 }
 
 // ── Zod schemas ──────────────────────────────────────────────────────

@@ -1804,6 +1804,93 @@ describe('POST /api/kanban/tasks/:id/execute', () => {
     expect(subagentsCalls).toBe(callsAtTerminal);
   });
 
+  it('completes a fallback kanban run when sessions.changed fires (event-driven path)', async () => {
+    let sessionsState: 'running' | 'done' = 'running';
+    let sessionsListCalls = 0;
+    const childSessionKey = 'agent:reviewer:subagent:event-driven-fallback-child';
+
+    const gatewayRpcMock = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'sessions.list') {
+        // The execute preflight check (no activeMinutes) just needs to see the parent session.
+        // The poller check (with activeMinutes) gets the parent + child sessions.
+        const parentSession = { sessionKey: 'agent:reviewer:main' };
+        const child = {
+          sessionKey: childSessionKey,
+          label: `kb-event-fallback-task-event-fallback-task-v2-789`,
+          status: sessionsState,
+          agentState: sessionsState === 'running' ? 'busy' : 'idle',
+          busy: sessionsState === 'running',
+          processing: sessionsState === 'running',
+        };
+        // Only count calls that are from the poller (not the preflight check)
+        if (params?.activeMinutes) {
+          sessionsListCalls += 1;
+          return { sessions: [parentSession, child] };
+        }
+        return { sessions: [parentSession, child] };
+      }
+      if (method === 'sessions.get') {
+        return {
+          messages: [{ role: 'assistant', content: 'fallback event-driven result' }],
+        };
+      }
+      return {};
+    });
+
+    vi.doMock('../lib/kanban-subagent-fallback.js', () => ({
+      buildKanbanFallbackRunKey: buildMockRootSessionKey,
+      resolveKanbanFallbackParentSessionKey: vi.fn((assignee?: string) => {
+        if (!assignee || assignee === 'operator') return null;
+        const match = assignee.match(/^agent:([^:]+)/);
+        if (!match || match[1] === 'main') return null;
+        return `agent:${match[1]}:main`;
+      }),
+      launchKanbanFallbackSubagentViaRpc: vi.fn(async ({ label, parentSessionKey }: { label: string; parentSessionKey: string }) => ({
+        sessionKey: buildMockRootSessionKey(label),
+        parentSessionKey,
+        childSessionKey,
+        knownSessionKeysBefore: [parentSessionKey],
+        runId: 'fb-run-789',
+      })),
+    }));
+
+    vi.spyOn(Date, 'now').mockReturnValue(789);
+
+    const app = await buildApp({ gatewayRpcMock, executionMode: 'fallback' });
+    const task = await createTask(app, { status: 'todo', title: 'Event fallback task', assignee: 'agent:reviewer' });
+
+    const execRes = await app.request(`/api/kanban/tasks/${task.id}/execute`, json({}));
+    expect(execRes.status).toBe(200);
+
+    // Let the watcher's immediate first check observe a running session.
+    await vi.waitFor(async () => {
+      expect(sessionsListCalls).toBeGreaterThan(0);
+    }, { timeout: 2_000, interval: 25 });
+
+    const taskAfterFirstCheck = await (await app.request(`/api/kanban/tasks/${task.id}`)).json() as KanbanTask;
+    expect(taskAfterFirstCheck.status).toBe('in-progress');
+
+    // Flip to done, then fire the event-driven wakeup.
+    sessionsState = 'done';
+    const sessionEvents = await import('../lib/session-events.js');
+    sessionEvents.emitSessionsChanged({});
+
+    await vi.waitFor(async () => {
+      const res = await app.request(`/api/kanban/tasks/${task.id}`);
+      const t = await res.json() as KanbanTask;
+      expect(t.run?.status).toBe('done');
+      expect(t.status).toBe('review');
+      expect(t.result).toContain('fallback event-driven result');
+    }, { timeout: 3_000, interval: 25 });
+
+    // Watcher should have unsubscribed; further events cause no extra gateway calls.
+    const callsAtTerminal = sessionsListCalls;
+    sessionEvents.emitSessionsChanged({});
+    sessionEvents.emitSessionsChanged({});
+    await new Promise((r) => setTimeout(r, 50));
+    expect(sessionsListCalls).toBe(callsAtTerminal);
+  });
+
 });
 
 // ── POST /api/kanban/tasks/:id/approve ───────────────────────────────
