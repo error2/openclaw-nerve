@@ -322,14 +322,14 @@ async function reportKanbanChildCompletionToParent(params: {
  * Watch gateway subagents for a kanban run until it finishes, then complete the run.
  *
  * Event-driven: subscribes to sessions.changed and runs a single check on every wakeup.
- * A long-interval fallback timer (kanbanFallbackPollMs) covers any missed events.
+ * A long-interval fallback timer (watcherFallbackPollMs) covers any missed events.
  * Concurrent wakeups are coalesced via an in-flight guard.
  */
 function pollSessionCompletion(
   store: ReturnType<typeof getKanbanStore>,
   taskId: string,
   identity: KanbanRunIdentity,
-  fallbackIntervalMs = config.kanbanFallbackPollMs,
+  fallbackIntervalMs = config.watcherFallbackPollMs,
   maxLifetimeMs = 60 * 60 * 1_000, // 60 minutes
 ): void {
   const startedAt = Date.now();
@@ -488,7 +488,7 @@ function pollFallbackSessionCompletion(
   store: ReturnType<typeof getKanbanStore>,
   taskId: string,
   identity: KanbanFallbackRunIdentity,
-  fallbackIntervalMs = config.kanbanFallbackPollMs,
+  fallbackIntervalMs = config.watcherFallbackPollMs,
   maxLifetimeMs = 60 * 60 * 1_000, // 60 minutes
 ): void {
   const startedAt = Date.now();

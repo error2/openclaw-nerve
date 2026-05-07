@@ -105,8 +105,11 @@ export const config = {
   ttsCacheTtlMs: Number(process.env.TTS_CACHE_TTL_MS || 3_600_000), // 1 hour
   ttsCacheMax: Number(process.env.TTS_CACHE_MAX || 200),
 
-  // Kanban watcher fallback poll interval (safety net for missed sessions.changed events)
-  kanbanFallbackPollMs: Number(process.env.NERVE_KANBAN_FALLBACK_POLL_MS) || 60_000,
+  // Watcher fallback poll interval (safety net for missed sessions.changed events)
+  watcherFallbackPollMs:
+    Number(process.env.NERVE_WATCHER_FALLBACK_POLL_MS)
+      || Number(process.env.NERVE_KANBAN_FALLBACK_POLL_MS)
+      || 60_000,
 
   // Authentication
   auth: (process.env.NERVE_AUTH || 'false').toLowerCase() === 'true',

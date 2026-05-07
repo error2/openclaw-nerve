@@ -438,7 +438,7 @@ function startCompletionMonitor(params: {
         await wakeup();
         if (!stopped) scheduleFallback();
       })();
-    }, config.kanbanFallbackPollMs);
+    }, config.watcherFallbackPollMs);
   };
 
   // Subscribe immediately so events arriving during warm-up are caught.

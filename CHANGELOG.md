@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Server-side kanban and subagent watchers now use the gateway's `sessions.subscribe` / `sessions.changed` event stream instead of fixed-interval polling. Idle gateway load drops to zero when no tasks are running, and completion-detection latency drops from 3-5s polling to <100ms event arrival. A 60s safety fallback poll (`NERVE_WATCHER_FALLBACK_POLL_MS`, default 60000) covers older gateways and missed events. Aligns with the upstream Control UI fix in [openclaw#59317](https://github.com/openclaw/openclaw/issues/59317).
+
+### Added
+- `resumeKanbanWatchers()` runs at Nerve startup and re-attaches watchers to any kanban task left in `in-progress` state by a previous Nerve crash or restart. Previously these tasks stayed stuck until manually aborted.
+- New env var `NERVE_WATCHER_FALLBACK_POLL_MS` to tune the safety fallback poll interval (default 60000). Affects both kanban completion watchers and subagent-spawn monitor. The legacy name `NERVE_KANBAN_FALLBACK_POLL_MS` is still read as a fallback for backwards compatibility.
+
+### Fixed
+- Eliminated the 3-5s `sessions.list` polling cadence that contributed to gateway event-loop pressure when kanban tasks or subagent monitors were active. Server-side root cause behind reports of `openclaw-control-ui` connection driving high gateway CPU.
+- `cleanupKanbanPollers()` now also unsubscribes session-events listeners and stops watchers properly. Previously listeners could leak across hot-reload / test reruns.
+
 ## [1.5.3] - 2026-04-21
 
 ### Highlights
