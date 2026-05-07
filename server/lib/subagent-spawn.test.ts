@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as gatewayRpc from './gateway-rpc.js';
+import { emitSessionsChanged } from './session-events.js';
 import {
   __resetSubagentSpawnTestState,
   buildSpawnSubagentMarkerMessage,
@@ -210,7 +211,8 @@ describe('subagent-spawn helper', () => {
       cleanup: 'keep',
     });
 
-    await vi.advanceTimersByTimeAsync(20_000);
+    // Advance past warm-up so first check fires (sees running), then past fallback interval.
+    await vi.advanceTimersByTimeAsync(70_000);
 
     const parentReport = calls.find((call) => call.method === 'sessions.send' && call.params.key === 'agent:reviewer:main');
     expect(parentReport).toBeTruthy();
@@ -383,5 +385,72 @@ describe('subagent-spawn helper', () => {
       parentSessionKey: 'agent:reviewer:main',
       task: 'Do something',
     })).rejects.toThrow('parent root not found');
+  });
+
+  it('finishes a subagent run when sessions.changed fires (event-driven path)', async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    let sessionDone = false;
+
+    vi.spyOn(gatewayRpc, 'gatewayRpcCall').mockImplementation(async (method, params) => {
+      calls.push({ method, params: params as Record<string, unknown> });
+
+      if (method === 'sessions.create') return { key: 'agent:reviewer:subagent:ev-child' };
+      if (method === 'sessions.send' && (params as Record<string, unknown>).key === 'agent:reviewer:subagent:ev-child') return { runId: 'run-ev' };
+      if (method === 'sessions.list') {
+        if (!sessionDone) {
+          return {
+            sessions: [{
+              sessionKey: 'agent:reviewer:subagent:ev-child',
+              status: 'running',
+              busy: true,
+              runId: 'run-ev',
+            }],
+          };
+        }
+        return {
+          sessions: [{
+            sessionKey: 'agent:reviewer:subagent:ev-child',
+            status: 'done',
+            agentState: 'idle',
+            busy: false,
+            processing: false,
+            runId: 'run-ev',
+          }],
+        };
+      }
+      if (method === 'sessions.get') {
+        return {
+          messages: [
+            { role: 'user', content: 'Do event task', runId: 'run-ev', timestamp: 100 },
+            { role: 'assistant', content: 'event result', runId: 'run-ev', timestamp: 101 },
+          ],
+        };
+      }
+      if (method === 'sessions.send' && (params as Record<string, unknown>).key === 'agent:reviewer:main') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+
+    await spawnSubagent({
+      parentSessionKey: 'agent:reviewer:main',
+      task: 'Do event task',
+      cleanup: 'keep',
+    });
+
+    // Advance past the warm-up delay so the first check sees the running state.
+    await vi.advanceTimersByTimeAsync(3_500);
+
+    // Flip the session to done and emit sessions.changed — this is the event-driven trigger.
+    sessionDone = true;
+    emitSessionsChanged({});
+
+    // Give the wakeup microtasks time to resolve.
+    await vi.advanceTimersByTimeAsync(100);
+
+    const parentReport = calls.find(
+      (call) => call.method === 'sessions.send' && call.params.key === 'agent:reviewer:main',
+    );
+    expect(parentReport).toBeTruthy();
+    expect(String(parentReport?.params.message ?? '')).toContain('Outcome: completed');
+    expect(String(parentReport?.params.message ?? '')).toContain('Result:\nevent result');
   });
 });

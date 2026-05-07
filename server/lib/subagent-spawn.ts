@@ -9,6 +9,8 @@
 
 import { randomUUID } from 'node:crypto';
 import { gatewayRpcCall } from './gateway-rpc.js';
+import { onSessionsChanged } from './session-events.js';
+import { config } from './config.js';
 
 export type SubagentCleanupMode = 'keep' | 'delete';
 
@@ -62,12 +64,12 @@ const ROOT_SESSION_RE = /^agent:[^:]+:main$/;
 const POLL_SESSIONS_ACTIVE_MINUTES = 24 * 60;
 const POLL_SESSIONS_LIMIT = 200;
 const MONITOR_INITIAL_DELAY_MS = 3_000;
-const MONITOR_POLL_INTERVAL_MS = 5_000;
-const MONITOR_MAX_ATTEMPTS = 720;
+const MONITOR_MAX_LIFETIME_MS = 60 * 60 * 1_000; // 60 minutes
 const MARKER_DISCOVERY_TIMEOUT_MS = 60_000;
 const MARKER_DISCOVERY_POLL_MS = 1_000;
 
 const activeMonitors = new Set<string>();
+const activeSubagentWatcherStops = new Set<() => void>();
 
 function schedule(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
   const timer = setTimeout(fn, ms);
@@ -310,8 +312,12 @@ function startCompletionMonitor(params: {
   if (activeMonitors.has(params.childSessionKey)) return;
   activeMonitors.add(params.childSessionKey);
 
-  let attempts = 0;
   let observedRunStart = false;
+  const startedAt = Date.now();
+  let inFlight = false;
+  let stopped = false;
+  let unsubscribe: (() => void) | null = null;
+  let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
   const finish = async (outcome: 'completed' | 'failed', details: { result?: string; error?: string }) => {
     activeMonitors.delete(params.childSessionKey);
@@ -342,11 +348,19 @@ function startCompletionMonitor(params: {
     }
   };
 
-  const poll = async () => {
-    attempts += 1;
-    if (attempts > MONITOR_MAX_ATTEMPTS) {
-      await finish('failed', { error: 'Subagent timed out (polling limit reached)' });
-      return;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    activeSubagentWatcherStops.delete(stop);
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+  };
+  activeSubagentWatcherStops.add(stop);
+
+  const check = async (): Promise<'continue' | 'stop'> => {
+    if (Date.now() - startedAt > MONITOR_MAX_LIFETIME_MS) {
+      await finish('failed', { error: 'Subagent timed out (watcher lifetime exceeded)' });
+      return 'stop';
     }
 
     try {
@@ -358,8 +372,7 @@ function startCompletionMonitor(params: {
       const session = sessions.find((candidate) => getSessionKey(candidate) === params.childSessionKey);
 
       if (!session) {
-        schedule(() => { void poll(); }, MONITOR_POLL_INTERVAL_MS);
-        return;
+        return 'continue';
       }
 
       if (sessionMentionsRunId(session, params.runId) || isBusySession(session)) {
@@ -368,12 +381,11 @@ function startCompletionMonitor(params: {
 
       if (isTerminalFailure(session)) {
         await finish('failed', { error: session.error || 'Child session failed' });
-        return;
+        return 'stop';
       }
 
       if (!isTerminalSuccess(session)) {
-        schedule(() => { void poll(); }, MONITOR_POLL_INTERVAL_MS);
-        return;
+        return 'continue';
       }
 
       const historyResponse = await gatewayRpcCall('sessions.get', {
@@ -392,20 +404,48 @@ function startCompletionMonitor(params: {
       }
 
       if (!observedRunStart) {
-        schedule(() => { void poll(); }, MONITOR_POLL_INTERVAL_MS);
-        return;
+        return 'continue';
       }
 
       await finish('completed', {
         result: extracted.resultText ?? 'Completed (no result text)',
       });
+      return 'stop';
     } catch (error) {
       console.warn(`[subagent-spawn] Poll error for ${params.childSessionKey}:`, error);
-      schedule(() => { void poll(); }, MONITOR_POLL_INTERVAL_MS);
+      return 'continue';
     }
   };
 
-  schedule(() => { void poll(); }, MONITOR_INITIAL_DELAY_MS);
+  const wakeup = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const next = await check();
+      if (next === 'stop') stop();
+    } catch (err) {
+      console.warn(`[subagent-spawn] Watcher error for ${params.childSessionKey}:`, err);
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const scheduleFallback = () => {
+    if (stopped) return;
+    fallbackTimer = setTimeout(() => {
+      fallbackTimer = null;
+      void (async () => {
+        await wakeup();
+        if (!stopped) scheduleFallback();
+      })();
+    }, config.kanbanFallbackPollMs);
+  };
+
+  // Subscribe immediately so events arriving during warm-up are caught.
+  unsubscribe = onSessionsChanged(() => { void wakeup(); });
+  scheduleFallback();
+  // Warm-up: first explicit wakeup after MONITOR_INITIAL_DELAY_MS (gateway needs time to register).
+  schedule(() => { void wakeup(); }, MONITOR_INITIAL_DELAY_MS);
 }
 
 async function launchDirect(params: SpawnSubagentParams): Promise<SpawnSubagentResult> {
@@ -517,4 +557,8 @@ export async function spawnSubagent(params: SpawnSubagentParams): Promise<SpawnS
 
 export function __resetSubagentSpawnTestState(): void {
   activeMonitors.clear();
+  for (const stop of [...activeSubagentWatcherStops]) {
+    try { stop(); } catch { /* ignore */ }
+  }
+  activeSubagentWatcherStops.clear();
 }
