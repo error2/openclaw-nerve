@@ -1733,6 +1733,76 @@ describe('POST /api/kanban/tasks/:id/execute', () => {
     expect(launchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('completes a primary kanban run when sessions.changed fires (event-driven path)', async () => {
+    let subagentsState: 'running' | 'done' = 'running';
+    let subagentsCalls = 0;
+
+    const invokeGatewayToolMock = vi.fn(async (tool: string) => {
+      if (tool === 'sessions_spawn') {
+        return { sessionKey: 'agent:main:subagent:event-driven-child' };
+      }
+      if (tool === 'subagents') {
+        subagentsCalls += 1;
+        const entry = {
+          label: '__PLACEHOLDER__',
+          sessionKey: 'agent:main:subagent:event-driven-child',
+          childSessionKey: 'agent:main:subagent:event-driven-child',
+          status: subagentsState,
+        };
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ active: subagentsState === 'running' ? [entry] : [], recent: subagentsState === 'done' ? [entry] : [] }) }],
+        };
+      }
+      if (tool === 'sessions_history') {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ messages: [{ role: 'assistant', content: 'event-driven completion result' }] }) }],
+        };
+      }
+      return {};
+    }) as GatewayToolMock;
+
+    const app = await buildApp({ invokeGatewayToolMock, executionMode: 'primary' });
+    const task = await createTask(app, { status: 'todo' });
+
+    const execRes = await app.request(`/api/kanban/tasks/${task.id}/execute`, json({}));
+    expect(execRes.status).toBe(200);
+
+    // Let fire-and-forget RPC helper attach run identifiers and the watcher's
+    // immediate first check observe a still-running session.
+    await vi.waitFor(async () => {
+      expect(subagentsCalls).toBeGreaterThan(0);
+    }, { timeout: 2_000, interval: 25 });
+
+    const taskAfterFirstCheck = await (await app.request(`/api/kanban/tasks/${task.id}`)).json() as KanbanTask;
+    expect(taskAfterFirstCheck.status).toBe('in-progress');
+
+    // Flip to done, then fire the event-driven wakeup.
+    subagentsState = 'done';
+    const sessionEvents = await import('../lib/session-events.js');
+    sessionEvents.emitSessionsChanged({});
+
+    await vi.waitFor(async () => {
+      const res = await app.request(`/api/kanban/tasks/${task.id}`);
+      const t = await res.json() as KanbanTask;
+      // completeRun transitions in-progress → review; the watcher's job is to fire it.
+      expect(t.run?.status).toBe('done');
+      expect(t.status).toBe('review');
+      expect(t.result).toContain('event-driven completion result');
+    }, { timeout: 3_000, interval: 25 });
+
+    // Now patch the unrelated child label that gets used for label-key matching
+    // (sanity: ensure we did not loop indefinitely)
+    expect(subagentsCalls).toBeLessThan(20);
+
+    // Cross-check: replay multiple rapid events while the run is already terminal,
+    // the watcher should have unsubscribed so no further subagents calls happen.
+    const callsAtTerminal = subagentsCalls;
+    sessionEvents.emitSessionsChanged({});
+    sessionEvents.emitSessionsChanged({});
+    sessionEvents.emitSessionsChanged({});
+    await new Promise((r) => setTimeout(r, 50));
+    expect(subagentsCalls).toBe(callsAtTerminal);
+  });
 
 });
 

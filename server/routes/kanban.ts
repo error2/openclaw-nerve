@@ -28,6 +28,8 @@ import {
 import { InvalidKanbanAssigneeError, resolveKanbanAssigneeRootSessionKey } from '../lib/kanban-assignee.js';
 import { invokeGatewayTool } from '../lib/gateway-client.js';
 import { gatewayRpcCall } from '../lib/gateway-rpc.js';
+import { onSessionsChanged } from '../lib/session-events.js';
+import { config } from '../lib/config.js';
 import { withMutex } from '../lib/mutex.js';
 import { parseKanbanMarkers, stripKanbanMarkers } from '../lib/parseMarkers.js';
 import {
@@ -308,22 +310,45 @@ async function reportKanbanChildCompletionToParent(params: {
   });
 }
 
-/** Poll gateway subagents for a kanban run until it finishes, then complete the run. */
+/**
+ * Watch gateway subagents for a kanban run until it finishes, then complete the run.
+ *
+ * Event-driven: subscribes to sessions.changed and runs a single check on every wakeup.
+ * A long-interval fallback timer (kanbanFallbackPollMs) covers any missed events.
+ * Concurrent wakeups are coalesced via an in-flight guard.
+ */
 function pollSessionCompletion(
   store: ReturnType<typeof getKanbanStore>,
   taskId: string,
   identity: KanbanRunIdentity,
-  intervalMs = 5_000,
-  maxAttempts = 720, // 60 minutes max
+  fallbackIntervalMs = config.kanbanFallbackPollMs,
+  maxLifetimeMs = 60 * 60 * 1_000, // 60 minutes
 ): void {
-  let attempts = 0;
+  const startedAt = Date.now();
+  let inFlight = false;
+  let stopped = false;
+  let unsubscribe: (() => void) | null = null;
+  let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const poll = async () => {
-    attempts++;
-    if (attempts > maxAttempts) {
-      console.warn(`[kanban] Polling timed out for task ${taskId} (runKey: ${identity.correlationKey})`);
-      await store.completeRun(taskId, identity.correlationKey, undefined, 'Run timed out (polling limit reached)').catch(() => {});
-      return;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (unsubscribe) {
+      unsubscribe();
+      unsubscribe = null;
+    }
+    if (fallbackTimer) {
+      clearTimeout(fallbackTimer);
+      activePollTimers.delete(fallbackTimer);
+      fallbackTimer = null;
+    }
+  };
+
+  const check = async (): Promise<'continue' | 'stop'> => {
+    if (Date.now() - startedAt > maxLifetimeMs) {
+      console.warn(`[kanban] Watcher lifetime exceeded for task ${taskId} (runKey: ${identity.correlationKey})`);
+      await store.completeRun(taskId, identity.correlationKey, undefined, 'Run timed out (watcher lifetime exceeded)').catch(() => {});
+      return 'stop';
     }
 
     try {
@@ -334,7 +359,7 @@ function pollSessionCompletion(
         || task.run?.status !== 'running'
         || task.run?.sessionKey !== identity.correlationKey
       ) {
-        return;
+        return 'stop';
       }
 
       const raw = await invokeGatewayTool('subagents', { action: 'list', recentMinutes: 120 });
@@ -345,8 +370,7 @@ function pollSessionCompletion(
 
       const match = findGatewayRunMatch(all, identity);
       if (!match) {
-        trackTimeout(poll, intervalMs);
-        return;
+        return 'continue';
       }
 
       const status = match.status as string;
@@ -383,7 +407,7 @@ function pollSessionCompletion(
           console.error(`[kanban] Failed to complete run for task ${taskId}:`, err);
           return null;
         });
-        if (!completedTask) return;
+        if (!completedTask) return 'stop';
 
         console.log(`[kanban] Run completed for task ${taskId} (runKey: ${identity.correlationKey})`);
 
@@ -399,23 +423,54 @@ function pollSessionCompletion(
             console.warn(`[kanban] Failed to create proposal from marker:`, err);
           }
         }
-        return;
+        return 'stop';
       }
 
       if (status === 'error' || status === 'failed') {
         const errorMsg = (match.error as string) || 'Agent session failed';
         await store.completeRun(taskId, identity.correlationKey, undefined, errorMsg).catch(() => {});
-        return;
+        return 'stop';
       }
 
-      trackTimeout(poll, intervalMs);
+      return 'continue';
     } catch (err) {
       console.error(`[kanban] Poll error for task ${taskId}:`, err);
-      trackTimeout(poll, intervalMs);
+      // Don't tear the watcher down on transient errors — let the next event/timer retry.
+      return 'continue';
     }
   };
 
-  trackTimeout(poll, 3_000);
+  const wakeup = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const next = await check();
+      if (next === 'stop') stop();
+    } catch (err) {
+      console.error(`[kanban] Watcher error for task ${taskId}:`, err);
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const scheduleFallback = () => {
+    if (stopped) return;
+    const timer = setTimeout(() => {
+      activePollTimers.delete(timer);
+      if (fallbackTimer === timer) fallbackTimer = null;
+      void (async () => {
+        await wakeup();
+        if (!stopped) scheduleFallback();
+      })();
+    }, fallbackIntervalMs);
+    fallbackTimer = timer;
+    activePollTimers.add(timer);
+  };
+
+  unsubscribe = onSessionsChanged(() => { void wakeup(); });
+  scheduleFallback();
+  // Immediate first check (replaces the old hardcoded 3s warm-up).
+  void wakeup();
 }
 
 /** Poll spawned macOS fallback child session until the task finishes. */
