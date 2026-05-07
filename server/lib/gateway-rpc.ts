@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { WebSocket } from 'ws';
 import { config } from './config.js';
 import { createDeviceBlock } from './device-identity.js';
+import { emitSessionsChanged } from './session-events.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -213,6 +214,12 @@ function ensureConnection(): void {
           rejectConnect(reason);
           socket.close();
         }
+        return;
+      }
+
+      // Forward sessions.changed events to in-process listeners
+      if (msg.type === 'event' && msg.event === 'sessions.changed') {
+        emitSessionsChanged(msg.payload);
         return;
       }
 

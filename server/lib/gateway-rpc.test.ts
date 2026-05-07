@@ -286,4 +286,32 @@ describe('gateway-rpc (persistent WebSocket)', () => {
       await expect(gatewayFilesSet('main', 'X', 'y')).rejects.toThrow('write failed');
     });
   });
+
+  describe('sessions.changed forwarding', () => {
+    it('forwards sessions.changed events to onSessionsChanged listeners', async () => {
+      const fresh = await importFreshGatewayRpc();
+      const sessionEvents = await import('./session-events.js');
+      sessionEvents.__resetSessionEventsForTesting();
+
+      const listener = vi.fn();
+      sessionEvents.onSessionsChanged(listener);
+
+      // Trigger a connection by issuing any RPC call
+      rpcHandler = () => ({ ok: true });
+      await fresh.gatewayRpcCall('agents.files.list', { agentId: 'main' });
+
+      // Server pushes a sessions.changed event
+      for (const client of wss.clients) {
+        client.send(JSON.stringify({
+          type: 'event',
+          event: 'sessions.changed',
+          payload: { key: 'agent:foo:main', status: 'done' },
+        }));
+      }
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalledWith({ key: 'agent:foo:main', status: 'done' });
+    });
+  });
 });
