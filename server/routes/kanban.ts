@@ -322,7 +322,7 @@ function pollSessionCompletion(
   taskId: string,
   identity: KanbanRunIdentity,
   fallbackIntervalMs = config.watcherFallbackPollMs,
-  maxLifetimeMs = 60 * 60 * 1_000, // 60 minutes
+  maxLifetimeMs = config.watcherMaxLifetimeMs,
 ): void {
   const startedAt = Date.now();
   let inFlight = false;
@@ -481,7 +481,7 @@ function pollFallbackSessionCompletion(
   taskId: string,
   identity: KanbanFallbackRunIdentity,
   fallbackIntervalMs = config.watcherFallbackPollMs,
-  maxLifetimeMs = 60 * 60 * 1_000, // 60 minutes
+  maxLifetimeMs = config.watcherMaxLifetimeMs,
 ): void {
   const startedAt = Date.now();
   let inFlight = false;
@@ -1642,6 +1642,14 @@ app.post('/api/kanban/tasks/:id/complete', rateLimitGeneral, async (c) => {
  * running run. Called on Nerve startup to recover from crashes/restarts
  * that orphaned in-memory pollers. Without this, a restart leaves
  * tasks stuck `in-progress` until manually aborted.
+ *
+ * If a child session completed between Nerve's crash and this function
+ * running, the gateway may have evicted it from `sessions.list` (depending
+ * on the `activeMinutes` window). In that case the watcher will not detect
+ * completion via events; the safety fallback poll will keep returning empty
+ * and the run will eventually be marked timed out by the lifetime cap
+ * (`config.watcherMaxLifetimeMs`). Operators can manually abort such tasks
+ * if waiting for the cap is undesirable.
  */
 export async function resumeKanbanWatchers(): Promise<void> {
   const store = getKanbanStore();

@@ -110,6 +110,7 @@ export const config = {
     Number(process.env.NERVE_WATCHER_FALLBACK_POLL_MS)
       || Number(process.env.NERVE_KANBAN_FALLBACK_POLL_MS)
       || 60_000,
+  watcherMaxLifetimeMs: Number(process.env.NERVE_WATCHER_MAX_LIFETIME_MS) || 3_600_000,
 
   // Authentication
   auth: (process.env.NERVE_AUTH || 'false').toLowerCase() === 'true',

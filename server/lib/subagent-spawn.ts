@@ -64,7 +64,7 @@ const ROOT_SESSION_RE = /^agent:[^:]+:main$/;
 const POLL_SESSIONS_ACTIVE_MINUTES = 24 * 60;
 const POLL_SESSIONS_LIMIT = 200;
 const MONITOR_INITIAL_DELAY_MS = 3_000;
-const MONITOR_MAX_LIFETIME_MS = 60 * 60 * 1_000; // 60 minutes
+const MONITOR_MAX_LIFETIME_MS = config.watcherMaxLifetimeMs;
 const MARKER_DISCOVERY_TIMEOUT_MS = 60_000;
 const MARKER_DISCOVERY_POLL_MS = 1_000;
 
