@@ -314,4 +314,61 @@ describe('gateway-rpc (persistent WebSocket)', () => {
       expect(listener).toHaveBeenCalledWith({ key: 'agent:foo:main', status: 'done' });
     });
   });
+
+  describe('sessions.subscribe auto-issue', () => {
+    it('issues sessions.subscribe after a successful connect', async () => {
+      const fresh = await importFreshGatewayRpc();
+      const seenMethods: string[] = [];
+      rpcHandler = (method) => {
+        seenMethods.push(method);
+        return { ok: true, subscribed: true };
+      };
+
+      await fresh.gatewayRpcCall('agents.files.list', { agentId: 'main' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(seenMethods).toContain('sessions.subscribe');
+    });
+
+    it('does not throw if the gateway rejects sessions.subscribe (older versions)', async () => {
+      const fresh = await importFreshGatewayRpc();
+      rpcHandler = (method) => {
+        if (method === 'sessions.subscribe') {
+          throw new Error('unknown method: sessions.subscribe');
+        }
+        return { ok: true };
+      };
+
+      await expect(fresh.gatewayRpcCall('agents.files.list', { agentId: 'main' })).resolves.toBeDefined();
+    });
+
+    it('reissues sessions.subscribe after reconnect', { timeout: 10_000 }, async () => {
+      const fresh = await importFreshGatewayRpc();
+      let subscribeCount = 0;
+      rpcHandler = (method) => {
+        if (method === 'sessions.subscribe') subscribeCount += 1;
+        return { ok: true, subscribed: true };
+      };
+
+      await fresh.gatewayRpcCall('agents.files.list', { agentId: 'main' });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(subscribeCount).toBe(1);
+
+      // Force a server-side close. The close event clears ws/connecting, so
+      // the next gatewayRpcCall immediately opens a fresh connection without
+      // waiting for RECONNECT_DELAY_MS (the reconnectTimer is a fallback; it
+      // doesn't block ensureConnection when ws and connecting are both falsy).
+      for (const client of wss.clients) client.close();
+
+      // Wait for the close event to propagate through the real I/O event loop.
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Trigger immediate reconnect via a new RPC call; this also drains the
+      // reconnectTimer race harmlessly.
+      await fresh.gatewayRpcCall('agents.files.list', { agentId: 'main' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(subscribeCount).toBe(2);
+    });
+  });
 });

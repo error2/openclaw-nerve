@@ -208,6 +208,12 @@ function ensureConnection(): void {
           connectResolve = null;
           connectReject = null;
           console.log('[gateway-rpc] Connected to gateway (persistent)');
+          // Best-effort subscribe to session change events.
+          // Older gateways may not support this; we log and continue.
+          void gatewayRpcCall('sessions.subscribe', {}).catch((err) => {
+            console.warn('[gateway-rpc] sessions.subscribe failed (older gateway?):',
+              (err as Error).message);
+          });
         } else {
           const reason = msg.error?.message || 'Gateway connect rejected';
           console.error('[gateway-rpc] Gateway connect rejected:', reason);
