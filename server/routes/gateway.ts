@@ -22,6 +22,11 @@ import path from 'node:path';
 import { z } from 'zod';
 import { invokeGatewayTool } from '../lib/gateway-client.js';
 import { rateLimitGeneral, rateLimitRestart } from '../middleware/rate-limit.js';
+import { coalesce } from '../middleware/coalesce.js';
+
+// `/api/gateway/session-info` fans out to `sessions.list` and the browser
+// polls it from useModelEffort.ts:134. Coalesce concurrent identical lookups.
+const SESSION_INFO_COALESCE_TTL_MS = 750;
 import { resolveOpenclawBin } from '../lib/openclaw-bin.js';
 import { config } from '../lib/config.js';
 
@@ -255,7 +260,7 @@ function pickPreferredSessionKey(sessions: GatewaySessionSummary[]): string {
   return getGatewaySessionKey(sessions[0] || {});
 }
 
-app.get('/api/gateway/session-info', rateLimitGeneral, async (c) => {
+app.get('/api/gateway/session-info', coalesce({ ttlMs: SESSION_INFO_COALESCE_TTL_MS }), rateLimitGeneral, async (c) => {
   const requestedSessionKey = c.req.query('sessionKey')?.trim() || '';
   const info: { model?: string; thinking?: string } = {};
 

@@ -17,8 +17,14 @@ import { join } from 'node:path';
 import { access, readdir, readFile } from 'node:fs/promises';
 import { config } from '../lib/config.js';
 import { rateLimitGeneral } from '../middleware/rate-limit.js';
+import { coalesce } from '../middleware/coalesce.js';
 import { spawnSubagent } from '../lib/subagent-spawn.js';
 import { normalizeAgentId } from '../lib/agent-workspace.js';
+
+// Window that absorbs the fanout from React rendering the session sidebar
+// (multiple pollers + tab focus refetches) without re-running the handler.
+// 750ms is below the polling-interval floor and well below perception.
+const SESSIONS_COALESCE_TTL_MS = 750;
 
 const app = new Hono();
 const CRON_SESSION_RE = /^agent:[^:]+:cron:[^:]+(?::run:.+)?$/;
@@ -233,7 +239,7 @@ app.get('/api/sessions/media', rateLimitGeneral, async (c) => {
   }
 });
 
-app.get('/api/sessions/hidden', rateLimitGeneral, async (c) => {
+app.get('/api/sessions/hidden', coalesce({ ttlMs: SESSIONS_COALESCE_TTL_MS }), rateLimitGeneral, async (c) => {
   const activeMinutesRaw = c.req.query('activeMinutes');
   const limitRaw = c.req.query('limit');
 
@@ -285,7 +291,7 @@ app.get('/api/sessions/hidden', rateLimitGeneral, async (c) => {
   }
 });
 
-app.get('/api/sessions/runtime', rateLimitGeneral, async (c) => {
+app.get('/api/sessions/runtime', coalesce({ ttlMs: SESSIONS_COALESCE_TTL_MS }), rateLimitGeneral, async (c) => {
   const sessionKey = c.req.query('sessionKey')?.trim() || '';
   if (!sessionKey) {
     return c.json({ ok: false, error: 'sessionKey is required' }, 400);

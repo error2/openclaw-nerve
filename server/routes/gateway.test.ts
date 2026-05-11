@@ -1,6 +1,13 @@
 /** Tests for the gateway routes (models, session-info, session-patch). */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { Hono } from 'hono';
+import { clearAllCoalesceCaches } from '../middleware/coalesce.js';
+
+beforeEach(() => {
+  // Coalesce middleware micro-caches identical GETs across calls. Clear it
+  // between tests so each mock setup starts from a clean slate.
+  clearAllCoalesceCaches();
+});
 
 let execFileImpl: (...args: unknown[]) => void;
 let readFileImpl: (...args: unknown[]) => Promise<string>;
