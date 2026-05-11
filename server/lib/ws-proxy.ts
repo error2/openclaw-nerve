@@ -25,6 +25,7 @@ import { createDeviceBlock, getDeviceIdentity } from './device-identity.js';
 import { gatewayRpcCall } from './gateway-rpc.js';
 import { canInjectGatewayToken } from './trust-utils.js';
 import { isAllowedOrigin } from './origin-utils.js';
+import { COALESCEABLE_WS_METHODS, coalescedGatewayCall } from './ws-coalesce.js';
 
 /** @internal — exported for test overrides */
 export const _internals = { challengeTimeoutMs: 5_000 };
@@ -439,6 +440,33 @@ function createGatewayRelay(
           } else {
             startChallengeDeadline();
           }
+          return;
+        }
+
+        // Intercept coalesceable read methods (e.g. sessions.list). The
+        // browser fires bursts of these from every render cycle; we route
+        // them through `coalescedGatewayCall` which shares one upstream
+        // request across concurrent identical callers and micro-caches the
+        // response. Same gateway-rpc connection nerve uses elsewhere, so the
+        // gateway sees one auth context.
+        if (msg.type === 'req' && COALESCEABLE_WS_METHODS.has(msg.method)) {
+          const reqId = msg.id;
+          coalescedGatewayCall(msg.method, msg.params || {})
+            .then((payload) => {
+              if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({ type: 'res', id: reqId, ok: true, payload }));
+              }
+            })
+            .catch((err) => {
+              if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({
+                  type: 'res',
+                  id: reqId,
+                  ok: false,
+                  error: { code: -32000, message: (err as Error).message },
+                }));
+              }
+            });
           return;
         }
 
