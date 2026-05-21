@@ -207,6 +207,10 @@ export interface ChatEventPayload {
   error?: string;
   errorMessage?: string;
   stopReason?: string;
+  // v4 additive: server-supplied incremental text on `state === 'delta'` frames.
+  // When absent, fall back to extracting from the cumulative `message` field.
+  deltaText?: string;
+  replace?: boolean;
 }
 
 /** Payload for 'agent' events (state changes + tool streaming) */
