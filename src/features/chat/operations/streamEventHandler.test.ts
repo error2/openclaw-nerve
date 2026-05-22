@@ -199,6 +199,69 @@ describe('extractStreamDelta', () => {
     expect(result).not.toBeNull();
     expect(result!.text).toContain('Hello world');
   });
+
+  it('accumulates v4 deltaText onto previousText when provided', () => {
+    // First delta event: previousText is empty; gateway emits deltaText="Hel"
+    // and cumulative message="Hel". Result must equal cumulative.
+    const first = {
+      state: 'delta',
+      deltaText: 'Hel',
+      message: {
+        role: 'assistant' as const,
+        content: [{ type: 'text' as const, text: 'Hel' }],
+      },
+    };
+    const r1 = extractStreamDelta(first, '');
+    expect(r1).not.toBeNull();
+    expect(r1!.text).toBe('Hel');
+
+    // Second delta event: previousText="Hel", deltaText="lo!". Cumulative
+    // message will still be "Hello!" but we should ignore it and accumulate
+    // via deltaText for efficiency / future-compat.
+    const second = {
+      state: 'delta',
+      deltaText: 'lo!',
+      message: {
+        role: 'assistant' as const,
+        content: [{ type: 'text' as const, text: 'Hello!' }],
+      },
+    };
+    const r2 = extractStreamDelta(second, r1!.text);
+    expect(r2).not.toBeNull();
+    expect(r2!.text).toBe('Hello!');
+  });
+
+  it('falls back to cumulative message extraction when deltaText is absent', () => {
+    // Previous text exists but the event lacks deltaText (v3 path). We must
+    // re-extract the full cumulative text from message.content, ignoring
+    // previousText so backwards compat holds.
+    const payload = {
+      state: 'delta',
+      message: {
+        role: 'assistant' as const,
+        content: [{ type: 'text' as const, text: 'Hello world' }],
+      },
+    };
+    const result = extractStreamDelta(payload, 'prior accumulated buffer');
+    expect(result).not.toBeNull();
+    expect(result!.text).toBe('Hello world');
+  });
+
+  it('falls back to cumulative when deltaText is present but no previousText', () => {
+    // Edge case: deltaText present but caller didn't pass previousText (e.g.
+    // older call site). Must fall back to cumulative-message extraction.
+    const payload = {
+      state: 'delta',
+      deltaText: ' world',
+      message: {
+        role: 'assistant' as const,
+        content: [{ type: 'text' as const, text: 'Hello world' }],
+      },
+    };
+    const result = extractStreamDelta(payload);
+    expect(result).not.toBeNull();
+    expect(result!.text).toBe('Hello world');
+  });
 });
 
 describe('extractFinalMessages', () => {

@@ -149,19 +149,35 @@ export function classifyStreamEvent(event: GatewayEvent): ClassifiedEvent | null
 /**
  * Extract the streaming text delta from a chat delta event.
  * Returns null if no text content is present.
+ *
+ * Under v4 (OpenClaw 2026.5.12+), the gateway emits an additive `deltaText`
+ * field on each `state: "delta"` chat event alongside the cumulative
+ * `message.content`. When the caller passes `previousText` (the cumulative
+ * text it has buffered so far for this run), we accumulate via `deltaText`
+ * instead of re-extracting from `message.content`. This is forward-compatible
+ * with a future gateway that drops the cumulative `message` field and is
+ * slightly more efficient on the hot path. When `deltaText` is absent or
+ * `previousText` is not provided, we fall back to the v3 cumulative path so
+ * older gateways and pre-existing call sites keep working unchanged.
  */
 export function extractStreamDelta(
   chatPayload: ChatEventPayload,
+  previousText?: string,
 ): { text: string; cleaned: string; ttsText: string | null; charts: ChartData[] } | null {
   if (chatPayload.state !== 'delta') return null;
-  if (!chatPayload.message || typeof chatPayload.message === 'string') return null;
 
-  const deltaText = extractText(chatPayload.message);
-  if (deltaText === undefined) return null;
+  let cumulative: string | undefined;
+  if (typeof chatPayload.deltaText === 'string' && previousText !== undefined) {
+    cumulative = previousText + chatPayload.deltaText;
+  } else {
+    if (!chatPayload.message || typeof chatPayload.message === 'string') return null;
+    cumulative = extractText(chatPayload.message);
+  }
+  if (cumulative === undefined) return null;
 
-  const { cleaned: ttsStripped, ttsText } = extractTTSMarkers(deltaText);
+  const { cleaned: ttsStripped, ttsText } = extractTTSMarkers(cumulative);
   const { cleaned, charts } = extractChartMarkers(ttsStripped);
-  return { text: deltaText, cleaned, ttsText, charts };
+  return { text: cumulative, cleaned, ttsText, charts };
 }
 
 // ─── Final message extraction ──────────────────────────────────────────────────

@@ -446,7 +446,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
         captureThinkingDuration();
 
-        const delta = extractStreamDelta(cp);
+        const delta = extractStreamDelta(cp, run.bufferRaw);
         if (delta) {
           run.bufferRaw = delta.text;
           run.bufferText = delta.cleaned;
